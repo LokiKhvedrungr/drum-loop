@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Drum Loop — шаманский бубен</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; height: 100%; background: #0e1a20; color: #fff;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Ubuntu, sans-serif;
+      user-select: none; touch-action: manipulation;
+    }
+    #ui {
+      position: fixed; top: 0; left: 0; right: 0; padding: 12px 16px;
+      display: flex; justify-content: space-between; align-items: center;
+      pointer-events: none; font-weight: 600; text-shadow: 0 0 6px #000;
+    }
+    #startScreen {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px; background: rgba(0,0,0,.85);
+    }
+    #startScreen button {
+      background: #ffb347; border: none; color: #000; font-weight: 700;
+      padding: 12px 20px; border-radius: 8px; font-size: 18px; cursor: pointer;
+    }
+    canvas { display:block; width:100%; height:100%; }
+    #spiritBarWrap{ position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+      width:60%; max-width:420px; height:10px; background:rgba(255,255,255,.1);
+      border-radius:999px; overflow:hidden; }
+    #spiritBar{ height:100%; width:0%; background:#ffcc66; transition:width .1s linear; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="ui">
+    <div>Очки: <span id="score">0</span></div>
+    <div>Комбо: <span id="combo">0</span></div>
+  </div>
+  <div id="spiritBarWrap"><div id="spiritBar"></div></div>
+
+  <div id="startScreen">
+    <h1>Drum Loop</h1>
+    <p style="opacity:.8;max-width:480px;text-align:center">Тапай по бубну в такт, чтобы удержать духа. 
+      Попади, когда сжимающееся кольцо достигает внутреннего круга.</p>
+    <button id="startBtn">Начать</button>
+    <p style="opacity:.5;font-size:14px">Клик/тап или пробел.</p>
+  </div>
+
+  <script>
+  // ===================== ПАРАМЕТРЫ И СОСТОЯНИЕ =====================
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const comboEl = document.getElementById('combo');
+  const spiritBarEl = document.getElementById('spiritBar');
+  const startScreen = document.getElementById('startScreen');
+  const startBtn = document.getElementById('startBtn');
+
+  let W = 0, H = 0, CX = 0, CY = 0; // размеры
+  let running = false;
+  
+  // Игровые метрики
+  let score = 0;
+  let combo = 0;
+  let spirit = 0; // 0..1
+
+  // Геометрия бубна
+  let drumRadius = 180;      // внешний радиус
+  let targetRadius = 90;     // радиус «зоны попадания»
+
+  // Ритм
+  let bpm = 90;              // можно менять по духам
+  let beatInterval = 60 / bpm; // сек на удар
+  let pulses = [];           // массив текущих волн
+  const pulseLife = beatInterval; // жизнь волны = один интервал
+  const startRadius = 260;    // начальный радиус волны
+  const hitWindow = 16;       // допуск в пикселях по радиусу
+  let lastSpawn = 0;
+
+  // Аудио (WebAudio)
+  let audioCtx;
+
+  function resize(){
+    canvas.width = W = window.innerWidth * devicePixelRatio;
+    canvas.height = H = window.innerHeight * devicePixelRatio;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.scale(devicePixelRatio, devicePixelRatio);
+    CX = window.innerWidth / 2;
+    CY = window.innerHeight / 2 + 60; // чуть ниже центра, чтобы был HUD
+    // подстраиваем радиусы под экран
+    const base = Math.min(window.innerWidth, window.innerHeight);
+    drumRadius = base * 0.22;
+    targetRadius = base * 0.11;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ===================== ВСПОМОГАТЕЛЬНЫЕ =====================
+  function spawnPulse(time){
+    pulses.push({ start: time, hit: false });
+  }
+
+  function currentRadius(pulse, t){
+    const life = (t - pulse.start) / pulseLife; // 0..1
+    const r = startRadius - life * (startRadius - targetRadius);
+    return r;
+  }
+
+  function playHit(){
+    try{
+      if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = 140 + combo*2; // чуть выше при комбо
+      gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.16);
+    }catch(e){}
+  }
+
+  function onTap(){
+    if(!running){ startGame(); return; }
+    const now = performance.now() / 1000;
+    // ищем последнюю волну, у которой ещё можно попасть
+    let candidate = null;
+    for(let i = pulses.length-1; i >= 0; i--){
+      const p = pulses[i];
+      if(p.hit) continue;
+      const life = (now - p.start) / pulseLife;
+      if(life < 0 || life > 1.2) continue; // вышла
+      candidate = p; break;
+    }
+    if(!candidate){ miss(); return; }
+    const r = currentRadius(candidate, now);
+    if(Math.abs(r - targetRadius) <= hitWindow){
+      hit(candidate);
+    }else{
+      miss();
+    }
+  }
+
+  function hit(pulse){
+    pulse.hit = true;
+    score += 10 + combo;
+    combo += 1;
+    spirit = Math.min(1, spirit + 0.02 + combo*0.001);
+    scoreEl.textContent = score;
+    comboEl.textContent = combo;
+    spiritBarEl.style.width = (spirit*100).toFixed(1)+'%';
+    playHit();
+  }
+
+  function miss(){
+    combo = 0;
+    comboEl.textContent = combo;
+    spirit = Math.max(0, spirit - 0.05);
+    spiritBarEl.style.width = (spirit*100).toFixed(1)+'%';
+  }
+
+  // ===================== РЕНДЕР =====================
+  function draw(time){
+    const t = time / 1000;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+
+    // фон — лес
+    drawBackground(t);
+
+    // костёр
+    drawFire(t);
+
+    // бубен
+    drawDrum(t);
+
+    // волны
+    drawPulses(t);
+
+    // спавн волн
+    if(t - lastSpawn >= beatInterval){
+      spawnPulse(t);
+      lastSpawn = t;
+    }
+
+    // удаляем старые
+    pulses = pulses.filter(p => (t - p.start) < pulseLife*1.2);
+
+    if(running) requestAnimationFrame(draw);
+  }
+
+  function drawBackground(t){
+    // градиент неба
+    const g = ctx.createLinearGradient(0,0,0,window.innerHeight);
+    g.addColorStop(0,'#0f1d24');
+    g.addColorStop(1,'#182a31');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,window.innerWidth,window.innerHeight);
+
+    // деревья тёмные силуэты
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    const baseY = window.innerHeight*0.65;
+    for(let i=0;i<12;i++){
+      const x = (i/11)*window.innerWidth + Math.sin(t*0.1+i)*5;
+      const h = 100 + Math.sin(i*12.34)*40;
+      drawPine(x, baseY, h);
+    }
+
+    // дух-медведь (едва заметный)
+    const alpha = 0.05 + spirit*0.1;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#ffffff';
+    const bx = window.innerWidth*0.8;
+    const by = window.innerHeight*0.22;
+    drawBear(bx, by, 160);
+    ctx.restore();
+  }
+
+  function drawPine(x, baseY, h){
+    ctx.beginPath();
+    ctx.moveTo(x, baseY-h);
+    ctx.lineTo(x-20, baseY);
+    ctx.lineTo(x+20, baseY);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawBear(x,y,s){
+    // очень упрощённая форма
+    ctx.beginPath();
+    ctx.arc(x, y, s*0.35, Math.PI*0.1, Math.PI*0.9, true); // голова
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x-s*0.25, y-s*0.28, s*0.08, 0, Math.PI*2); // ухо1
+    ctx.arc(x+s*0.25, y-s*0.28, s*0.08, 0, Math.PI*2); // ухо2
+    ctx.fill();
+  }
+
+  function drawFire(t){
+    const x = CX, y = CY + drumRadius + 60;
+    const flameH = 40 + Math.sin(t*10)*6 + combo*0.2;
+    const width = 100;
+    ctx.save();
+    ctx.translate(x,y);
+    for(let i=0;i<5;i++){
+      ctx.beginPath();
+      const a = 0.5 + Math.sin(t*8 + i)*0.2;
+      ctx.fillStyle = `rgba(255, ${150+i*20}, 80, ${0.4 + a*0.4})`;
+      ctx.moveTo(-width/2 + i*8, 0);
+      ctx.quadraticCurveTo(0, -flameH - i*12, width/2 - i*8, 0);
+      ctx.fill();
+    }
+    // поленья
+    ctx.fillStyle = '#3b2a1f';
+    ctx.fillRect(-70,0,140,8);
+    ctx.restore();
+  }
+
+  function drawDrum(t){
+    // ножка
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.fillStyle = '#3b2a1f';
+    ctx.fillRect(-16, drumRadius, 32, 60);
+
+    // сам бубен
+    // обод
+    ctx.beginPath();
+    ctx.arc(0,0, drumRadius+12, 0, Math.PI*2);
+    ctx.fillStyle = '#3b2a1f';
+    ctx.fill();
+
+    // кожа
+    ctx.beginPath();
+    ctx.arc(0,0, drumRadius, 0, Math.PI*2);
+    ctx.fillStyle = '#c9b08a';
+    ctx.fill();
+
+    // внутр. круг цели
+    ctx.beginPath();
+    ctx.arc(0,0, targetRadius, 0, Math.PI*2);
+    ctx.strokeStyle = `rgba(255, 180, 60, ${0.25 + spirit*0.5})`;
+    ctx.lineWidth = 6;
+    ctx.stroke();
+
+    // руна в центре (простая)
+    ctx.strokeStyle = `rgba(255, 120, 40, ${0.3 + combo*0.01})`;
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(0, -targetRadius*0.6);
+    ctx.lineTo(0, targetRadius*0.6);
+    ctx.moveTo(-targetRadius*0.35, 0);
+    ctx.lineTo(targetRadius*0.35, 0);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawPulses(t){
+    ctx.save();
+    ctx.translate(CX, CY);
+    for(const p of pulses){
+      const life = (t - p.start) / pulseLife;
+      if(life < 0 || life > 1.2) continue;
+      const r = currentRadius(p, t);
+      const a = 1 - life;
+      ctx.beginPath();
+      ctx.arc(0,0, r, 0, Math.PI*2);
+      ctx.strokeStyle = `rgba(255, 200, 120, ${0.25 + a*0.6})`;
+      ctx.lineWidth = 8;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ===================== СТАРТ / ИВЕНТЫ =====================
+  function startGame(){
+    if(!audioCtx){ // создаём по первому действию (для iOS и т.д.)
+      try{ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){}
+    }
+    running = true;
+    score = combo = 0; spirit = 0;
+    scoreEl.textContent = '0'; comboEl.textContent = '0'; spiritBarEl.style.width = '0%';
+    pulses = []; lastSpawn = performance.now()/1000;
+    startScreen.style.display = 'none';
+    requestAnimationFrame(draw);
+  }
+
+  window.addEventListener('pointerdown', onTap);
+  window.addEventListener('keydown', e => {
+    if(e.code === 'Space') { e.preventDefault(); onTap(); }
+  });
+  startBtn.addEventListener('click', startGame);
+  </script>
+</body>
+</html>
